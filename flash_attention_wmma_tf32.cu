@@ -156,7 +156,7 @@ void launch_flash_attention_wmma_tf32(
     CUDA_CHECK(cudaMemset(d_m, neg_inf, B * H * N * sizeof(float)));
     
     // Calculate shared memory size
-    const int shmem_size = (7 * col_tile_size * D * sizeof(float)) + (col_tile_size * row_tile_size * sizeof(float));
+    const int shmem_size = (10 * col_tile_size * D * sizeof(float)) + (col_tile_size * row_tile_size * sizeof(float));
     cudaFuncSetAttribute(flash_attention_kernel_wmma_tf32, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024); // Set to 100KB
 
     dim3 grid(B, H);

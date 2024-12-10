@@ -12,6 +12,9 @@
 #include "flash_attention_basic.cu"
 #include "flash_attention_wmma_tf32.cu"
 #include "flash_attention_wmma_fp16.cu"
+#include "flash_attention_ptx_tf32.cu"
+#include "flash_attention_ptx_fp16.cu"
+#include "flash_attention_ptx_fp8.cu"
 #include "utils.cuh"
 
 void initialize_tensor(std::vector<float>& tensor, int size) {
@@ -272,8 +275,8 @@ int main() {
     srand(0);
     initialize_cuda_device();
 
-    const int B = 32;    // Batch size
-    const int N = 64;   // Sequence length
+    const int B = 64;    // Batch size
+    const int N = 128;   // Sequence length
     const int H = 8;    // Number of attention heads
     const int d = 64;   // Dimension per head
     const int num_iterations = 10;  // Number of benchmark iterations
@@ -373,6 +376,39 @@ int main() {
     flash_speedup = gpu_results.min_time_ms / flash_results_wmma_fp16.min_time_ms;
 
     print_benchmark_results("Flash (WMMA FP16)", flash_results_wmma_fp16);
+    std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
+    std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
+
+    // PTX TF32
+    auto flash_results_ptx_tf32 = run_flash_attention_benchmark(d_Q, d_K, d_V, d_output, B, N, H, d, num_iterations, launch_flash_attention_ptx_tf32);
+    CUDA_CHECK(cudaMemcpy(h_output_flash.data(), d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost));
+    rrmse_gpu_flash = compare_results(h_output_gpu_base, h_output_flash, output_size);
+
+    flash_speedup = gpu_results.min_time_ms / flash_results_ptx_tf32.min_time_ms;
+
+    print_benchmark_results("Flash (PTX TF32)", flash_results_ptx_tf32);
+    std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
+    std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
+
+    // PTX FP16
+    auto flash_results_ptx_fp16 = run_flash_attention_benchmark(d_Q, d_K, d_V, d_output, B, N, H, d, num_iterations, launch_flash_attention_ptx_fp16);
+    CUDA_CHECK(cudaMemcpy(h_output_flash.data(), d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost));
+    rrmse_gpu_flash = compare_results(h_output_gpu_base, h_output_flash, output_size);
+
+    flash_speedup = gpu_results.min_time_ms / flash_results_ptx_fp16.min_time_ms;
+
+    print_benchmark_results("Flash (PTX FP16)", flash_results_ptx_fp16);
+    std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
+    std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
+
+    // PTX FP8
+    auto flash_results_ptx_fp8 = run_flash_attention_benchmark(d_Q, d_K, d_V, d_output, B, N, H, d, num_iterations, launch_flash_attention_ptx_fp8);
+    CUDA_CHECK(cudaMemcpy(h_output_flash.data(), d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost));
+    rrmse_gpu_flash = compare_results(h_output_gpu_base, h_output_flash, output_size);
+
+    flash_speedup = gpu_results.min_time_ms / flash_results_ptx_fp8.min_time_ms;
+
+    print_benchmark_results("Flash (PTX FP8)", flash_results_ptx_fp8);
     std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
     std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 

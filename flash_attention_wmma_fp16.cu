@@ -1,3 +1,6 @@
+#include "utils.cuh"
+#include <mma.h>
+
 using namespace nvcuda::wmma;
 
 __global__
@@ -37,24 +40,28 @@ void flash_attention_kernel_wmma_fp16(
     
     for (int j = 0; j < num_col_tiles; j++) {
         // Load in Kj, Vj to shmem
-        for (int x = 0; x < d; x++) {
-            // int shmem_idx = (threadId * d) + x;
-            int shmem_idx = x * col_tile_size + threadId;
-            int idx = qkv_offset + (j * col_tile_size + threadId) * d + x;  // Row-major input
-            KjT[shmem_idx] = K[idx];
-        }
-        for (int x = 0; x < d; x++) {
-            int shmem_idx = threadId * d + x;
-            int idx = qkv_offset + (j * col_tile_size + threadId) * d + x;  // Row-major input
-            Vj[shmem_idx] = V[idx];
+        if (threadId < col_tile_size) {
+            for (int x = 0; x < d; x++) {
+                // int shmem_idx = (threadId * d) + x;
+                int shmem_idx = x * col_tile_size + threadId;
+                int idx = qkv_offset + (j * col_tile_size + threadId) * d + x;  // Row-major input
+                KjT[shmem_idx] = K[idx];
+            }
+            for (int x = 0; x < d; x++) {
+                int shmem_idx = threadId * d + x;
+                int idx = qkv_offset + (j * col_tile_size + threadId) * d + x;  // Row-major input
+                Vj[shmem_idx] = V[idx];
+            }
         }
         __syncthreads();
 
         for (int i = 0; i < num_row_tiles; i++) {
             // Load Qi to shmem
             // Load l and m to registers
-            for (int x = 0; x < d; x++) {
-                Qi[(threadId * d) + x] = Q[qkv_offset + (tile_size * i) + (threadId * d) + x];
+            if (threadId < row_tile_size) {
+                for (int x = 0; x < d; x++) {
+                    Qi[(threadId * d) + x] = Q[qkv_offset + (tile_size * i) + (threadId * d) + x];
+                }
             }
             float row_m_prev = m[l_m_offset + (row_tile_size * i) + threadId];
             float row_l_prev = l[l_m_offset + (row_tile_size * i) + threadId];
@@ -68,9 +75,11 @@ void flash_attention_kernel_wmma_fp16(
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
 
-            for (int x = 0; x < d; x++) {
-                Qi_half[threadId * d + x] = __float2half(Qi[threadId * d + x]);
-                KjT_half[x * col_tile_size + threadId] = __float2half(KjT[x * col_tile_size + threadId]);
+            if (threadId < col_tile_size) {
+                for (int x = 0; x < d; x++) {
+                    Qi_half[threadId * d + x] = __float2half(Qi[threadId * d + x]);
+                    KjT_half[x * col_tile_size + threadId] = __float2half(KjT[x * col_tile_size + threadId]);
+                }
             }
             __syncthreads();
 
@@ -92,37 +101,41 @@ void flash_attention_kernel_wmma_fp16(
             float row_l = 0;
             float row_m_new, row_l_new;
 
-            // Scale S
-            for (int y = 0; y < col_tile_size; y++) {
-                S[(col_tile_size * threadId) + y] *= scale;
-            }
+            if (threadId < col_tile_size) {
+                // Scale S
+                for (int y = 0; y < col_tile_size; y++) {
+                    S[(col_tile_size * threadId) + y] *= scale;
+                }
 
-            // Then compute row max
-            for (int y = 0; y < col_tile_size; y++) {
-                row_m = max(row_m, S[(col_tile_size * threadId) + y]);
-            }
+                // Then compute row max
+                for (int y = 0; y < col_tile_size; y++) {
+                    row_m = max(row_m, S[(col_tile_size * threadId) + y]);
+                }
 
-            for (int y = 0; y < col_tile_size; y++) {
-                S[(col_tile_size * threadId) + y] = __expf(S[(col_tile_size * threadId) + y] - row_m);
-                row_l += S[(col_tile_size * threadId) + y];
-            }
+                for (int y = 0; y < col_tile_size; y++) {
+                    S[(col_tile_size * threadId) + y] = __expf(S[(col_tile_size * threadId) + y] - row_m);
+                    row_l += S[(col_tile_size * threadId) + y];
+                }
 
-            row_m_new = max(row_m_prev, row_m);
-            row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + 
-                        (__expf(row_m - row_m_new) * row_l);
+                row_m_new = max(row_m_prev, row_m);
+                row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + 
+                            (__expf(row_m - row_m_new) * row_l);
+            }
             __syncthreads();
             // Update O, l, m
             
             // S: N x N, Vj: N x d
             // tmp_result: N x d
 
-            // Convert S matrix (maintaining row-major layout)
-            for (int y = 0; y < col_tile_size; y++) {
-                S_half[threadId * col_tile_size + y] = __float2half(S[threadId * col_tile_size + y]);
-            }
-            // Convert V matrix (maintaining row-major layout)
-            for (int x = 0; x < d; x++) {
-                Vj_half[threadId * d + x] = __float2half(Vj[threadId * d + x]);
+            if (threadId < col_tile_size) {
+                // Convert S matrix (maintaining row-major layout)
+                for (int y = 0; y < col_tile_size; y++) {
+                    S_half[threadId * col_tile_size + y] = __float2half(S[threadId * col_tile_size + y]);
+                }
+                // Convert V matrix (maintaining row-major layout)
+                for (int x = 0; x < d; x++) {
+                    Vj_half[threadId * d + x] = __float2half(Vj[threadId * d + x]);
+                }
             }
             __syncthreads();
 
@@ -140,16 +153,18 @@ void flash_attention_kernel_wmma_fp16(
                 }
             }
 
-            for (int x = 0; x < d; x++) {
-                O[qkv_offset + (tile_size * i) + (threadId * d) + x] = 
-                    (1 / row_l_new) * (
-                        (row_l_prev * __expf(row_m_prev - row_m_new) * 
-                        O[qkv_offset + (tile_size * i) + (threadId * d) + x]) +
-                        (__expf(row_m - row_m_new) * tmp_result[threadId * d + x])
-                    );
+            if (threadId < col_tile_size) {
+                for (int x = 0; x < d; x++) {
+                    O[qkv_offset + (tile_size * i) + (threadId * d) + x] = 
+                        (1 / row_l_new) * (
+                            (row_l_prev * __expf(row_m_prev - row_m_new) * 
+                            O[qkv_offset + (tile_size * i) + (threadId * d) + x]) +
+                            (__expf(row_m - row_m_new) * tmp_result[threadId * d + x])
+                        );
+                }
+                m[l_m_offset + (row_tile_size * i) + threadId] = row_m_new;
+                l[l_m_offset + (row_tile_size * i) + threadId] = row_l_new;
             }
-            m[l_m_offset + (row_tile_size * i) + threadId] = row_m_new;
-            l[l_m_offset + (row_tile_size * i) + threadId] = row_l_new;
         }
         __syncthreads();
     }
