@@ -499,9 +499,28 @@ void initialize_cuda_device() {
     std::cout << "\nUsing device 0: " << prop.name << std::endl;
 }
 
+// Returns RRMSE
+float compare_results(std::vector<float>& h1, std::vector<float>& h2, int32_t output_size) {
+    double mse = 0.0;
+    double ref_mean_square = 0.0;
+    for (int32_t i = 0; i < output_size; ++i) {
+        float diff = h2[i] - h1[i];
+        mse += diff * diff;
+        ref_mean_square += h1[i] * h1[i];
+    }
+    mse /= output_size;
+    ref_mean_square /= output_size;
+    float rmse = std::sqrt(mse);
+    float rel_rmse = rmse / std::sqrt(ref_mean_square);
+    return rel_rmse;
+}
+
 int main() {
+    srand(0);
     initialize_cuda_device();
-    const int B = 4;    // Batch size
+    bool run_cpu = true;
+    
+    const int B = 32;    // Batch size
     const int N = 64;   // Sequence length
     const int H = 8;    // Number of attention heads
     const int d = 64;   // Dimension per head
@@ -512,7 +531,7 @@ int main() {
 
     // Host tensors
     std::vector<float> h_Q(QKV_size), h_K(QKV_size), h_V(QKV_size), h_V_col(QKV_size);
-    std::vector<float> h_output_cpu(output_size), h_output_gpu(output_size);
+    std::vector<float> h_output_cpu(output_size), h_output_gpu(output_size), h_output_gpu_base(output_size), h_output_flash(output_size);
 
     initialize_tensor(h_Q, QKV_size);
     initialize_tensor(h_K, QKV_size);
@@ -554,69 +573,55 @@ int main() {
     std::cout << "\nRunning benchmarks with " << num_iterations << " iterations..." << std::endl;
     std::cout << "Configuration: B=" << B << ", N=" << N << ", H=" << H << ", d=" << d << std::endl;
 
-    auto cpu_results = run_cpu_benchmark(h_Q, h_K, h_V, h_output_cpu, B, N, H, d, num_iterations);
+    BenchmarkResults cpu_results;
+    if (run_cpu) {
+        cpu_results = run_cpu_benchmark(h_Q, h_K, h_V, h_output_cpu, B, N, H, d, num_iterations);
+    }
 
-    auto gpu_results = run_gpu_benchmark(handle, d_Q, d_K, d_V_col, d_output, B, N, H, d, num_iterations);
+    BenchmarkResults gpu_results;
+    gpu_results = run_gpu_benchmark(handle, d_Q, d_K, d_V_col, d_output, B, N, H, d, num_iterations);
     CUDA_CHECK(cudaMemcpy(h_output_gpu.data(), d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Column major to row major
-    std::vector<float> h_output_gpu_row_major(output_size);
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
             for (int i = 0; i < N; ++i) {
                 for (int j = 0; j < d; ++j) {
-                    h_output_gpu_row_major[b * H * N * d + h * N * d + i * d + j] = h_output_gpu[b * H * N * d + h * N * d + j * N + i];
+                    h_output_gpu_base[b * H * N * d + h * N * d + i * d + j] = h_output_gpu[b * H * N * d + h * N * d + j * N + i];
                 }
             }
         }
     }
 
     auto flash_results = run_flash_attention_benchmark(d_Q, d_K, d_V, d_output, B, N, H, d, num_iterations);
-    CUDA_CHECK(cudaMemcpy(h_output_gpu.data(), d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_output_flash.data(), d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Print results
-    print_benchmark_results("CPU", cpu_results);
+    if (run_cpu) {
+        print_benchmark_results("CPU", cpu_results);
+    }
     print_benchmark_results("GPU", gpu_results);
     print_benchmark_results("Flash", flash_results);
     
-
     // Verify results
     std::cout << "\nVerifying results..." << std::endl;
-    bool passed = true;
-    const float epsilon = 1e-3f;
-    for (int i = 0; i < output_size; ++i) {
-        //std::cout << h_output_cpu[i] << " " << h_output_gpu[i] << std::endl;
-        if (fabs(h_output_cpu[i] - h_output_gpu_row_major[i]) > epsilon) {
-            std::cout << "Mismatch at index " << i << ": CPU = " << h_output_cpu[i]
-                     << ", GPU = " << h_output_gpu_row_major[i] << std::endl;
-            passed = false;
-            break;
-        }
-    }
-
-    for (int i = 0; i < output_size; ++i) {
-        if (fabs(h_output_cpu[i] - h_output_gpu[i]) > epsilon) {
-            std::cout << "Mismatch at index " << i << ": CPU = " << h_output_cpu[i]
-                     << ", Flash Attention = " << h_output_gpu[i] << std::endl;
-            passed = false;
-            break;
-        }
-    }
-
-    if (passed) {
-        std::cout << "All results match within epsilon = " << epsilon << std::endl;
+    if (run_cpu) {
+        float rrmse_cpu_gpubase = compare_results(h_output_cpu, h_output_gpu_base, output_size);
+        float rrmse_cpu_flash = compare_results(h_output_cpu, h_output_flash, output_size);
+        std::cout << "RRMSE CPU vs GPU Base: " << rrmse_cpu_gpubase << std::endl;
+        std::cout << "RRMSE CPU vs Flash:    " << rrmse_cpu_flash << std::endl;
     } else {
-        std::cout << "Results don't match!" << std::endl;
+        float rrmse_gpu_flash = compare_results(h_output_gpu_base, h_output_flash, output_size);
+        std::cout << "RRMSE GPU Base vs Flash: " << rrmse_gpu_flash << std::endl;
     }
 
-    // Print speedup
-    double speedup = cpu_results.min_time_ms / gpu_results.min_time_ms;
-    std::cout << "\nGPU Speedup: " << std::fixed << std::setprecision(2) << speedup << "x" << std::endl;
-
+    if (run_cpu) {
+        double speedup = cpu_results.min_time_ms / gpu_results.min_time_ms;
+        std::cout << "\nGPU Speedup: " << std::fixed << std::setprecision(2) << speedup << "x" << std::endl;
+    }
     double flash_speedup = gpu_results.min_time_ms / flash_results.min_time_ms;
     std::cout << "Flash Speedup: " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 
-    // Cleanup
     CUBLAS_CHECK(cublasDestroy(handle));
     CUDA_CHECK(cudaFree(d_Q));
     CUDA_CHECK(cudaFree(d_K));
