@@ -7,8 +7,8 @@ from torch.utils.cpp_extension import load
 
 def load_cuda_module():
     return load(
-        name="flash_attention",
-        sources=["flash_attention.cpp", "attention_tensor_tf32.cu"], # May need to change these depending on naming
+        name="flash_attention_ptx_fp8",
+        sources=["pytorch_flash_attention_main.cpp", "flash_attention_ptx_fp8.cu"], # May need to change these depending on naming
         extra_cuda_cflags=["-O2", "--gpu-architecture=sm_90", "--ptxas-options=-v"],
         verbose=True,
         build_directory="build",
