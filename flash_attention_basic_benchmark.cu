@@ -9,26 +9,8 @@
 #include <numeric>    // for accumulate
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-
-// CUDA check macro
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            std::cerr << "CUDA error in " << __FILE__ << ":" << __LINE__ << ": " << cudaGetErrorString(err) << std::endl; \
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
-
-// cuBLAS check macro
-#define CUBLAS_CHECK(call) \
-    do { \
-        cublasStatus_t status = call; \
-        if (status != CUBLAS_STATUS_SUCCESS) { \
-            std::cerr << "cuBLAS error in " << __FILE__ << ":" << __LINE__ << std::endl; \
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
+#include "flash_attention_basic.cu"
+#include "utils.cuh"
 
 void flash_attention_cpu(const float* Q, const float* K, const float* V, float* output, int B, int N, int H, int d) {
     std::vector<float> scores(N * N);
@@ -287,137 +269,11 @@ BenchmarkResults run_gpu_benchmark(cublasHandle_t handle,
     return results;
 }
 
-__global__
-void flash_attention_kernel(
-    const float* Q,   // [B, H, N, D]
-    const float* K,     // [B, H, N, D]
-    const float* V,      // [B, H, N, D]
-    const int N,       // sequence length
-    const int d,   // hidden dimension
-    const int num_col_tiles,    
-    const int num_row_tiles,   
-    const int col_tile_size,   
-    const int row_tile_size,   
-    const float scale,
-    float* l,      // running sum [B, H, N]
-    float* m,      // running max [B, H, N]
-    float* O       // output [B, H, N, D]
-) {
-    int threadId = threadIdx.x;
-    int batch_idx = blockIdx.x; int head_idx = blockIdx.y;
-
-    int qkv_offset = (batch_idx * gridDim.y * N * d) + (head_idx * N * d);
-    int l_m_offset = (batch_idx * gridDim.y * N) + (head_idx * N);
-
-    extern __shared__ float shmem[];
-    int tile_size = col_tile_size * d;
-    float* Qi = shmem;
-    float* Kj = &shmem[tile_size];
-    float* Vj = &shmem[tile_size * 2];
-    float* S = &shmem[tile_size * 3];
-
-    for (int j = 0; j < num_col_tiles; j++) {
-        // Load in Kj, Vj to shmem
-        for (int x = 0; x < d; x++) {
-            int shmem_idx = (threadId * d) + x;
-            int idx = qkv_offset + (tile_size * j) + shmem_idx;
-            Kj[shmem_idx] = K[idx];
-            Vj[shmem_idx] = V[idx];
-        }
-        __syncthreads();
-
-        for (int i = 0; i < num_row_tiles; i++) {
-            // Load Qi to shmem
-            // Load l and m to registers
-            for (int x = 0; x < d; x++) {
-                Qi[(threadId * d) + x] = Q[qkv_offset + (tile_size * i) + (threadId * d) + x];
-            }
-            float row_m_prev = m[l_m_offset + (row_tile_size * i) + threadId];
-            float row_l_prev = l[l_m_offset + (row_tile_size * i) + threadId];
-
-            // S = QK^T, row_m = rowmax(S)
-            float row_m = -INFINITY;
-            for (int y = 0; y < col_tile_size; y++) {
-                float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(threadId * d) + x] * Kj[(y * d) + x];
-                }
-                sum *= scale;
-                S[(col_tile_size * threadId) + y] = sum;
-                row_m = max(row_m, sum);
-            }
-
-            float row_l = 0;
-            for (int y = 0; y < col_tile_size; y++) {
-                S[(col_tile_size * threadId) + y] = __expf(S[(col_tile_size * threadId) + y] - row_m);
-                row_l += S[(col_tile_size * threadId) + y];
-            }
-
-            float row_m_new = max(row_m_prev, row_m);
-            float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + 
-                             (__expf(row_m - row_m_new) * row_l);
-
-            // Update O, l, m
-            for (int x = 0; x < d; x++) {
-                float pv = 0;
-                for (int y = 0; y < col_tile_size; y++) {
-                    pv += S[(col_tile_size * threadId) + y] * Vj[(y * d) + x];
-                }
-                O[qkv_offset + (tile_size * i) + (threadId * d) + x] = 
-                    (1 / row_l_new) * (
-                        (row_l_prev * __expf(row_m_prev - row_m_new) * 
-                         O[qkv_offset + (tile_size * i) + (threadId * d) + x]) +
-                        (__expf(row_m - row_m_new) * pv)
-                    );
-            }
-            m[l_m_offset + (row_tile_size * i) + threadId] = row_m_new;
-            l[l_m_offset + (row_tile_size * i) + threadId] = row_l_new;
-        }
-        __syncthreads();
-    }
-}
-
-void launch_flash_attention(
-    const float* Q, const float* K, const float* V, float* O,
-    const int B, const int H, const int N, const int D
-) {
-    const int col_tile_size = 32;
-    const int row_tile_size = 32;
-    
-    const int num_col_tiles = (N + col_tile_size - 1) / col_tile_size; 
-    const int num_row_tiles = (N + row_tile_size - 1) / row_tile_size;
-    const float scale = 1.0f / sqrt(D);
-    
-    // Allocate and initialize running statistics
-    float *d_l, *d_m;
-    CUDA_CHECK(cudaMalloc(&d_l, B * H * N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_m, B * H * N * sizeof(float)));
-    
-    CUDA_CHECK(cudaMemset(d_l, 0, B * H * N * sizeof(float)));
-    float neg_inf = -INFINITY;
-    CUDA_CHECK(cudaMemset(d_m, neg_inf, B * H * N * sizeof(float)));
-    
-    // Calculate shared memory size
-    const int shmem_size = (3 * col_tile_size * D * sizeof(float)) + (col_tile_size * row_tile_size * sizeof(float));
-    int max_shmem_size;
-    cudaDeviceGetAttribute(&max_shmem_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-    // printf("Max shared memory: %d, requested shared memory: %d\n", max_shmem_size, shmem_size);
-    
-    dim3 grid(B, H); 
-    dim3 block(col_tile_size); 
-    
-    flash_attention_kernel<<<grid, block, shmem_size>>>(
-        Q, K, V, N, D, num_col_tiles, num_row_tiles, col_tile_size, row_tile_size, scale, d_l, d_m, O
-    );
-    
-    cudaFree(d_l);
-    cudaFree(d_m);
-}
-
 BenchmarkResults run_flash_attention_benchmark(
     float* d_Q, float* d_K, float* d_V, float* d_output,
     int B, int N, int H, int d,
-    int num_iterations) {
+    int num_iterations,
+    void (*launch_flash_attention_fn)(const float*, const float*, const float*, float*, const int, const int, const int, const int)) {
     
     BenchmarkResults results;
     results.individual_times.reserve(num_iterations);
@@ -432,7 +288,7 @@ BenchmarkResults run_flash_attention_benchmark(
         
         CUDA_CHECK(cudaEventRecord(start));
         
-        launch_flash_attention(d_Q, d_K, d_V, d_output, B, H, N, d);
+        launch_flash_attention_fn(d_Q, d_K, d_V, d_output, B, H, N, d);
         
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -519,7 +375,7 @@ int main() {
     srand(0);
     initialize_cuda_device();
     bool run_cpu = true;
-    
+
     const int B = 32;    // Batch size
     const int N = 64;   // Sequence length
     const int H = 8;    // Number of attention heads
@@ -593,7 +449,7 @@ int main() {
         }
     }
 
-    auto flash_results = run_flash_attention_benchmark(d_Q, d_K, d_V, d_output, B, N, H, d, num_iterations);
+    auto flash_results = run_flash_attention_benchmark(d_Q, d_K, d_V, d_output, B, N, H, d, num_iterations, launch_flash_attention_basic);
     CUDA_CHECK(cudaMemcpy(h_output_flash.data(), d_output, output_size * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Print results
