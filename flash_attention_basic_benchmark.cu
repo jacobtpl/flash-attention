@@ -309,12 +309,29 @@ BenchmarkResults run_flash_attention_benchmark(
     return results;
 }
 
-void print_benchmark_results(const std::string& name, const BenchmarkResults& results) {
+double calculate_attention_flops(int B, int H, int N, int d) {
+    double flops = 0.0;
+    // Q * K^T: N x d @ d x N = N x N multiplication-adds
+    flops += B * H * 2.0 * N * N * d;
+    // Softmax: 4N operations per column (exp, sum, divide)
+    flops += B * H * 4.0 * N * N;
+    // Attention * V: N x N @ N x d = N x d multiplication-adds
+    flops += B * H * 2.0 * N * N * d;
+    return flops;
+}
+
+void print_benchmark_results(const std::string& name, const BenchmarkResults& results, int B, int N, int H, int d) {
     std::cout << "\n=== " << name << " Performance ===" << std::endl;
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "Average time: " << results.avg_time_ms << " ms" << std::endl;
     std::cout << "Min time:     " << results.min_time_ms << " ms" << std::endl;
     std::cout << "Max time:     " << results.max_time_ms << " ms" << std::endl;
+    
+    // Calculate and print TFLOPS based on min time (best performance)
+    double total_flops = calculate_attention_flops(B, H, N, d);
+    double tflops = (total_flops / (results.min_time_ms * 1e-3)) / 1e12;
+    std::cout << "TFLOPS:       " << tflops << std::endl;
+    
     std::cout << "Variance:     " << std::fixed << std::setprecision(6)
               << std::accumulate(results.individual_times.begin(), results.individual_times.end(), 0.0,
                                [&](double acc, double x) {
@@ -376,8 +393,8 @@ int main() {
     initialize_cuda_device();
     bool run_cpu = true;
 
-    const int B = 32;    // Batch size
-    const int N = 64;   // Sequence length
+    const int B = 128;    // Batch size
+    const int N = 128;   // Sequence length
     const int H = 8;    // Number of attention heads
     const int d = 64;   // Dimension per head
     const int num_iterations = 10;  // Number of benchmark iterations
@@ -454,10 +471,10 @@ int main() {
 
     // Print results
     if (run_cpu) {
-        print_benchmark_results("CPU", cpu_results);
+        print_benchmark_results("CPU", cpu_results, B, N, H, d);
     }
-    print_benchmark_results("GPU", gpu_results);
-    print_benchmark_results("Flash", flash_results);
+    print_benchmark_results("GPU", gpu_results, B, N, H, d);
+    print_benchmark_results("Flash", flash_results, B, N, H, d);
     
     // Verify results
     std::cout << "\nVerifying results..." << std::endl;

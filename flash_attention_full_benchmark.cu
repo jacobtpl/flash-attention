@@ -209,12 +209,29 @@ BenchmarkResults run_flash_attention_benchmark(
     return results;
 }
 
-void print_benchmark_results(const std::string& name, const BenchmarkResults& results) {
+double calculate_attention_flops(int B, int H, int N, int d) {
+    double flops = 0.0;
+    // Q * K^T: N x d @ d x N = N x N multiplication-adds
+    flops += B * H * 2.0 * N * N * d;
+    // Softmax: 4N operations per column (exp, sum, divide)
+    flops += B * H * 4.0 * N * N;
+    // Attention * V: N x N @ N x d = N x d multiplication-adds
+    flops += B * H * 2.0 * N * N * d;
+    return flops;
+}
+
+void print_benchmark_results(const std::string& name, const BenchmarkResults& results, int B, int N, int H, int d) {
     std::cout << "\n=== " << name << " Performance ===" << std::endl;
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "Average time: " << results.avg_time_ms << " ms" << std::endl;
     std::cout << "Min time:     " << results.min_time_ms << " ms" << std::endl;
     std::cout << "Max time:     " << results.max_time_ms << " ms" << std::endl;
+    
+    // Calculate and print TFLOPS based on min time (best performance)
+    double total_flops = calculate_attention_flops(B, H, N, d);
+    double tflops = (total_flops / (results.min_time_ms * 1e-3)) / 1e12;
+    std::cout << "TFLOPS:       " << tflops << std::endl;
+    
     std::cout << "Variance:     " << std::fixed << std::setprecision(6)
               << std::accumulate(results.individual_times.begin(), results.individual_times.end(), 0.0,
                                [&](double acc, double x) {
@@ -342,7 +359,7 @@ int main() {
         }
     }
 
-    print_benchmark_results("GPU", gpu_results);
+    print_benchmark_results("GPU", gpu_results, B, N, H, d);
 
     float rrmse_gpu_flash, flash_speedup;
 
@@ -353,7 +370,7 @@ int main() {
 
     flash_speedup = gpu_results.min_time_ms / flash_results_basic.min_time_ms;
 
-    print_benchmark_results("Flash (Basic)", flash_results_basic);
+    print_benchmark_results("Flash (Basic)", flash_results_basic, B, N, H, d);
     std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
     std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 
@@ -364,7 +381,7 @@ int main() {
 
     flash_speedup = gpu_results.min_time_ms / flash_results_wmma_tf32.min_time_ms;
 
-    print_benchmark_results("Flash (WMMA TF32)", flash_results_wmma_tf32);
+    print_benchmark_results("Flash (WMMA TF32)", flash_results_wmma_tf32, B, N, H, d);
     std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
     std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 
@@ -375,7 +392,7 @@ int main() {
 
     flash_speedup = gpu_results.min_time_ms / flash_results_wmma_fp16.min_time_ms;
 
-    print_benchmark_results("Flash (WMMA FP16)", flash_results_wmma_fp16);
+    print_benchmark_results("Flash (WMMA FP16)", flash_results_wmma_fp16, B, N, H, d);
     std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
     std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 
@@ -386,7 +403,7 @@ int main() {
 
     flash_speedup = gpu_results.min_time_ms / flash_results_ptx_tf32.min_time_ms;
 
-    print_benchmark_results("Flash (PTX TF32)", flash_results_ptx_tf32);
+    print_benchmark_results("Flash (PTX TF32)", flash_results_ptx_tf32, B, N, H, d);
     std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
     std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 
@@ -397,7 +414,7 @@ int main() {
 
     flash_speedup = gpu_results.min_time_ms / flash_results_ptx_fp16.min_time_ms;
 
-    print_benchmark_results("Flash (PTX FP16)", flash_results_ptx_fp16);
+    print_benchmark_results("Flash (PTX FP16)", flash_results_ptx_fp16, B, N, H, d);
     std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
     std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 
@@ -408,7 +425,7 @@ int main() {
 
     flash_speedup = gpu_results.min_time_ms / flash_results_ptx_fp8.min_time_ms;
 
-    print_benchmark_results("Flash (PTX FP8)", flash_results_ptx_fp8);
+    print_benchmark_results("Flash (PTX FP8)", flash_results_ptx_fp8, B, N, H, d);
     std::cout << "RRMSE:        " << rrmse_gpu_flash << std::endl;
     std::cout << "Speedup:      " << std::fixed << std::setprecision(2) << flash_speedup << "x" << std::endl;
 
