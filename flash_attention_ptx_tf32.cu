@@ -102,13 +102,11 @@ void flash_attention_kernel_ptx_tf32(
 
         for (int i = 0; i < num_row_tiles; i++) {
             // Reset S to zero
-            if (threadId < col_tile_size) {
-                for (int y = 0; y < col_tile_size; y++) {
-                    S[(col_tile_size * threadId) + y] = 0.0f;
-                }
-                for (int x = 0; x < d; x++) {
-                    tmp_result[threadId * d + x] = 0.0f;
-                }
+            for (int y = 0; y < col_tile_size; y++) {
+                S[(col_tile_size * threadId) + y] = 0.0f;
+            }
+            for (int x = 0; x < d; x++) {
+                tmp_result[threadId * d + x] = 0.0f;
             }
             __syncthreads();
 
@@ -143,42 +141,28 @@ void flash_attention_kernel_ptx_tf32(
                     }
                 }
             }
-            // Print matrix S for debugging
-            // if (threadId == 0 && blockIdx.x == 0 && blockIdx.y == 0 && j == 0 && i == 0) {
-            //     printf("\nMatrix S:\n");
-            //     for (int si = 0; si < row_tile_size; si++) {
-            //         for (int sj = 0; sj < col_tile_size; sj++) {
-            //             printf("%.4f ", S[si * col_tile_size + sj]);
-            //         }
-            //         printf("\n");
-            //     }
-            //     printf("\n");
-            // }
-            // __syncthreads();
             float row_m = -INFINITY;
             float row_l = 0;
             float row_m_new, row_l_new;
 
-            if (threadId < col_tile_size) {
-                // Scale S
-                for (int y = 0; y < col_tile_size; y++) {
-                    S[(col_tile_size * threadId) + y] *= scale;
-                }
-
-                // Then compute row max
-                for (int y = 0; y < col_tile_size; y++) {
-                    row_m = max(row_m, S[(col_tile_size * threadId) + y]);
-                }
-
-                for (int y = 0; y < col_tile_size; y++) {
-                    S[(col_tile_size * threadId) + y] = __expf(S[(col_tile_size * threadId) + y] - row_m);
-                    row_l += S[(col_tile_size * threadId) + y];
-                }
-
-                row_m_new = max(row_m_prev, row_m);
-                row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + 
-                            (__expf(row_m - row_m_new) * row_l);
+            // Scale S
+            for (int y = 0; y < col_tile_size; y++) {
+                S[(col_tile_size * threadId) + y] *= scale;
             }
+
+            // Then compute row max
+            for (int y = 0; y < col_tile_size; y++) {
+                row_m = max(row_m, S[(col_tile_size * threadId) + y]);
+            }
+
+            for (int y = 0; y < col_tile_size; y++) {
+                S[(col_tile_size * threadId) + y] = __expf(S[(col_tile_size * threadId) + y] - row_m);
+                row_l += S[(col_tile_size * threadId) + y];
+            }
+
+            row_m_new = max(row_m_prev, row_m);
+            row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + 
+                        (__expf(row_m - row_m_new) * row_l);
             __syncthreads();
             // Update O, l, m
             
@@ -193,25 +177,16 @@ void flash_attention_kernel_ptx_tf32(
                 }
             }
 
-            if (threadId < col_tile_size) {
-                // for (int x = 0; x < d; x++) {
-                //     float pv = 0;
-                //     for (int y = 0; y < col_tile_size; y++) {
-                //         pv += S[(col_tile_size * threadId) + y] * Vj[y * d + x];
-                //     }
-                //     tmp_result[threadId * d + x] = pv;
-                // }
-                for (int x = 0; x < d; x++) {
-                    O[qkv_offset + (tile_size * i) + (threadId * d) + x] = 
-                        (1 / row_l_new) * (
-                            (row_l_prev * __expf(row_m_prev - row_m_new) * 
-                            O[qkv_offset + (tile_size * i) + (threadId * d) + x]) +
-                            (__expf(row_m - row_m_new) * tmp_result[threadId * d + x])
-                        );
-                }
-                m[l_m_offset + (row_tile_size * i) + threadId] = row_m_new;
-                l[l_m_offset + (row_tile_size * i) + threadId] = row_l_new;
+            for (int x = 0; x < d; x++) {
+                O[qkv_offset + (tile_size * i) + (threadId * d) + x] = 
+                    (1 / row_l_new) * (
+                        (row_l_prev * __expf(row_m_prev - row_m_new) * 
+                        O[qkv_offset + (tile_size * i) + (threadId * d) + x]) +
+                        (__expf(row_m - row_m_new) * tmp_result[threadId * d + x])
+                    );
             }
+            m[l_m_offset + (row_tile_size * i) + threadId] = row_m_new;
+            l[l_m_offset + (row_tile_size * i) + threadId] = row_l_new;
         }
         __syncthreads();
     }
