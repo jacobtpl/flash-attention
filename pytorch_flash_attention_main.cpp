@@ -1,7 +1,6 @@
 #include <torch/extension.h>
 #include <vector>
 #include <cuda_runtime.h>
-#include "flash_attention_ptx_fp8.cu"
 
 // Declaration of CUDA kernel launcher
 void launch_flash_attention_ptx_fp8(const float* Q, const float* K, const float* V, float* O,
